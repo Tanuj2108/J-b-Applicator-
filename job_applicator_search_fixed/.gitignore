@@ -1,0 +1,12 @@
+.env
+profile.json
+profile.json.tmp
+answers.json
+answers.json.tmp
+application_history.json
+application_history.json.tmp
+.venv/
+__pycache__/
+.streamlit/
+.private/
+.deps/
