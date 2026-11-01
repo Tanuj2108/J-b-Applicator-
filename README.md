@@ -1,1 +1,1 @@
-# J-b-Applicator-
+# J*b Applicator
