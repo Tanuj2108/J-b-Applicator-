@@ -1,7 +1,8 @@
 """Search LinkedIn first, then only company career domains supplied by the user."""
 
 import re
-from urllib.parse import urlsplit, urlunsplit
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 BLOCKED_HOSTS = {
     "instagram.com", "youtube.com", "youtu.be", "tiktok.com", "facebook.com",
@@ -71,6 +72,64 @@ def _job_title_from_url(url: str) -> str:
     return slug.replace("-at-", " at ").replace("-", " ").strip().title() or "LinkedIn job"
 
 
+class _ApplyLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.current: dict[str, str] | None = None
+        self.links: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a" and self.current is None:
+            values = dict(attrs)
+            self.current = {
+                "href": values.get("href") or "",
+                "label": " ".join(values.get(key) or "" for key in ("aria-label", "title")),
+            }
+
+    def handle_data(self, data: str) -> None:
+        if self.current is not None:
+            self.current["label"] += " " + data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.current is not None:
+            self.links.append((self.current["href"], " ".join(self.current["label"].split())))
+            self.current = None
+
+
+def direct_application_url(listing_url: str, html: str) -> str:
+    """Return an explicit Apply link when one clear form destination is present."""
+    parser = _ApplyLinks()
+    parser.feed(html)
+    candidates: dict[str, int] = {}
+    for href, label in parser.links:
+        label = label.lower()
+        if not re.match(r"^apply\b|^start application\b", label) or len(label) > 80:
+            continue
+        if any(term in label for term in ("apply filters", "how to apply", "application status")):
+            continue
+        try:
+            url = urljoin(listing_url, href)
+            parts = urlsplit(url)
+        except ValueError:
+            continue
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+            continue
+        host = _host(url)
+        if any(_within(host, blocked) for blocked in BLOCKED_HOSTS):
+            continue
+        if _canonical(url) == _canonical(listing_url):
+            continue
+        if _within(host, "linkedin.com") and urlsplit(url).path.lower().startswith("/jobs/view/"):
+            continue
+        score = 2 if re.search(r"/(?:apply|application)(?:/|$)", parts.path.lower()) else 1
+        candidates[url] = max(score, candidates.get(url, 0))
+    if not candidates:
+        return ""
+    top = max(candidates.values())
+    best = [url for url, score in candidates.items() if score == top]
+    return best[0] if len(best) == 1 else ""
+
+
 def search_jobs(profile: dict[str, str], api_key: str, limit: int = 12) -> list[dict[str, str]]:
     from tinyfish import TinyFish
 
@@ -85,7 +144,7 @@ def search_jobs(profile: dict[str, str], api_key: str, limit: int = 12) -> list[
     client = TinyFish(api_key=api_key)
     found: dict[str, dict] = {}
 
-    def add(url: str, title: str, snippet: str, source: str, applyable: bool = True) -> None:
+    def add(url: str, title: str, snippet: str, source: str, applyable: bool = True, apply_url: str = "") -> None:
         if not url.startswith("https://") or not allowed_application_url(url, profile):
             return
         canonical = _canonical(url)
@@ -102,7 +161,7 @@ def search_jobs(profile: dict[str, str], api_key: str, limit: int = 12) -> list[
         found[canonical] = {
             "title": title, "url": canonical, "snippet": snippet[:500], "score": score,
             "salary_status": "In range" if pay else "Salary not verified",
-            "source": source, "applyable": applyable,
+            "source": source, "applyable": applyable, "apply_url": apply_url,
         }
 
     # Broad search finds LinkedIn job category pages. Fetch exposes their individual /jobs/view links.
@@ -140,16 +199,18 @@ def search_jobs(profile: dict[str, str], api_key: str, limit: int = 12) -> list[
     fetched_urls = set()
     if detail_urls:
         try:
-            details = client.fetch.get_contents(detail_urls[:10], format="markdown", links=False, image_links=False, per_url_timeout_ms=30000)
+            details = client.fetch.get_contents(detail_urls[:10], format="html", links=False, image_links=False, per_url_timeout_ms=30000)
             for page in getattr(details, "results", []) or []:
                 url = str(getattr(page, "url", "") or "")
                 fetched_urls.add(_canonical(url))
                 title = str(getattr(page, "title", "") or _job_title_from_url(url))
                 snippet = str(getattr(page, "description", "") or "")
+                html = str(getattr(page, "text", "") or "")
                 if not snippet:
-                    snippet = str(getattr(page, "text", "") or "")[:500]
+                    snippet = " ".join(re.sub(r"<[^>]*>", " ", html).split())[:500]
                 found.pop(_canonical(url), None)
-                add(url, title, snippet, "LinkedIn")
+                page_url = str(getattr(page, "final_url", "") or url)
+                add(url, title, snippet, "LinkedIn", apply_url=direct_application_url(page_url, html))
         except Exception:
             pass
     for url in detail_urls:
@@ -165,4 +226,15 @@ def search_jobs(profile: dict[str, str], api_key: str, limit: int = 12) -> list[
             url = str(getattr(item, "url", "") or "")
             if _within(_host(url), domain):
                 add(url, str(getattr(item, "title", "") or url), str(getattr(item, "snippet", "") or ""), "Company career site")
+    company_urls = [job["url"] for job in found.values() if job["source"] == "Company career site"][:10]
+    if company_urls:
+        try:
+            details = client.fetch.get_contents(company_urls, format="html", links=False, image_links=False, per_url_timeout_ms=30000)
+            for page in getattr(details, "results", []) or []:
+                key = _canonical(str(getattr(page, "url", "") or ""))
+                if key in found:
+                    page_url = str(getattr(page, "final_url", "") or found[key]["url"])
+                    found[key]["apply_url"] = direct_application_url(page_url, str(getattr(page, "text", "") or ""))
+        except Exception:
+            pass
     return sorted(found.values(), key=lambda job: job["score"], reverse=True)[:limit]
